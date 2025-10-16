@@ -1,0 +1,510 @@
+from nuscenes.utils.data_classes import LidarPointCloud, Box
+import numpy as np
+from functools import reduce
+from typing import Tuple, List, Dict
+from nuscenes import NuScenes
+from nuscenes.utils.geometry_utils import transform_matrix
+from pyquaternion import Quaternion
+import os.path as osp
+
+
+# NUM_CROSS_ROAD_SENSOR = 15
+NUM_CROSS_ROAD_SENSOR = 0
+# NUM_TYPES_OF_SENSORS = 23
+NUM_TYPES_OF_SENSORS = 12
+
+def from_file_multisweep_upperbound_sample_data(
+    nusc: "NuScenes",
+    ref_sd_rec: Dict,
+    return_trans_matrix: bool = False,
+    # min_distance: float = 1.0,
+    min_distance: float = 0.1,
+    no_cross_road=False,
+):
+    """
+    Added by Yiming. 2021.4.14 teacher's input
+    上界数据加载器：将扫描数据转换为智能体 0 的局部坐标系下的数据，
+    :param ref_sd_rec: 当前的样本数据记录（激光雷达顶部传感器编号为 0 的数据记录）
+    :param return_trans_matrix: 是否需要返回变换矩阵
+    :param min_distance: 低于此距离的点将被舍弃的距离值。
+    :return: （all_pc，all_times）。聚合后的点云数据和时间戳。
+    """
+    # 初始化
+    # 创建一个全零的数组，用于存储点云数据，形状为（LidarPointCloud的维度数，0）
+    points = np.zeros((LidarPointCloud.nbr_dims(), 0))
+    # 使用上述数组创建LidarPointCloud对象，用于表示点云
+    all_pc = LidarPointCloud(points)
+    # 创建一个全零的数组，用于存储时间戳，形状为（1, 0）
+    all_times = np.zeros((1, 0))
+
+    # 获取参考姿态和时间戳
+    # 根据当前样本数据记录中的ego_pose_token，从nusc对象中获取自我姿态记录
+    ref_pose_rec = nusc.get("ego_pose", ref_sd_rec["ego_pose_token"])
+    # 根据当前样本数据记录中的calibrated_sensor_token，从nusc对象中获取校准传感器记录
+    ref_cs_rec = nusc.get("calibrated_sensor", ref_sd_rec["calibrated_sensor_token"])
+    # 将当前样本数据记录中的时间戳转换为秒（原时间戳单位可能为微秒）
+    ref_time = 1e-6 * ref_sd_rec["timestamp"]
+
+    # 计算从自我汽车坐标系到参考坐标系的齐次变换矩阵
+    # 使用校准传感器记录中的平移和旋转信息，计算逆变换矩阵
+    ref_from_car = transform_matrix(
+        ref_cs_rec["translation"], Quaternion(ref_cs_rec["rotation"]), inverse=True
+    )
+
+    # 计算从全局坐标系到当前自我汽车坐标系的齐次变换矩阵
+    # 使用自我姿态记录中的平移和旋转信息，计算逆变换矩阵
+    car_from_global = transform_matrix(
+        ref_pose_rec["translation"], Quaternion(ref_pose_rec["rotation"]), inverse=True
+    )
+
+    # 聚合当前和之前的扫描数据
+    # 将当前样本数据记录初始化为参考样本数据记录
+    current_sd_rec = ref_sd_rec
+    # 创建一个空列表，用于存储变换矩阵
+    trans_matrix_list = list()
+    # 初始化跳过帧数为0
+    skip_frame = 0
+    # 根据参考样本数据记录中的sample_token，从nusc对象中获取样本记录
+    sample_record = nusc.get("sample", ref_sd_rec["sample_token"])
+
+    # 设定传感器数量为5（这里直接设定，未使用原来的计算方式）
+    num_sensor = 5
+
+    for k in range(num_sensor):
+        # 如果no_cross_road为True且当前是第一个传感器（k==0），则跳过本次循环
+        if no_cross_road and k == 0:
+            continue
+
+        # 加载点云数据
+        # 获取当前传感器（LIDAR_BOTTOM_id_ + k）的点云数据令牌
+        pointsensor_token = sample_record["data"]["LIDAR_BOTTOM_id_" + str(k)]
+        # 根据点云数据令牌，从nusc对象中获取当前样本数据记录
+        current_sd_rec = nusc.get("sample_data", pointsensor_token)
+        # 根据当前样本数据记录中的文件名，从文件中加载点云数据
+        current_pc = LidarPointCloud.from_file(
+            osp.join(nusc.dataroot, current_sd_rec["filename"])
+        )
+
+        # 获取ego的姿态
+        # 根据当前样本数据记录中的ego_pose_token，从nusc对象中获取自我姿态记录
+        current_pose_rec = nusc.get("ego_pose", current_sd_rec["ego_pose_token"])
+        # 使用当前自我姿态记录中的平移和旋转信息，计算从当前自我汽车坐标系到全局坐标系的变换矩阵
+        global_from_car = transform_matrix(
+            current_pose_rec["translation"],
+            Quaternion(current_pose_rec["rotation"]),
+            inverse=False,
+        )
+
+        # 计算从传感器坐标系到当前自我汽车坐标系的齐次变换矩阵
+        # 根据当前样本数据记录中的calibrated_sensor_token，从nusc对象中获取校准传感器记录
+        current_cs_rec = nusc.get(
+            "calibrated_sensor", current_sd_rec["calibrated_sensor_token"]
+        )
+        # 使用校准传感器记录中的平移和旋转信息，计算从传感器坐标系到当前自我汽车坐标系的变换矩阵
+        car_from_current = transform_matrix(
+            current_cs_rec["translation"],
+            Quaternion(current_cs_rec["rotation"]),
+            inverse=False,
+        )
+
+        # 将四个变换矩阵融合为一个，并对当前点云进行变换
+        # 使用reduce函数和np.dot方法，将四个变换矩阵相乘，得到最终的变换矩阵
+        trans_matrix = reduce(
+            np.dot, [ref_from_car, car_from_global, global_from_car, car_from_current]
+        )
+        # 使用最终的变换矩阵对当前点云进行变换
+        current_pc.transform(trans_matrix)
+
+        # 收集变换矩阵
+        # 将当前的变换矩阵添加到变换矩阵列表中
+        trans_matrix_list.append(trans_matrix)
+
+        # 去除近距离点并添加时间向量
+        # 根据设定的最小距离，去除当前点云中距离过近的点
+        current_pc.remove_close(min_distance)
+        # 计算当前点云数据的时间滞后
+        time_lag = ref_time - 1e-6 * (
+            current_sd_rec["timestamp"] + k
+        )  # positive difference
+
+        # 如果k是(skip_frame + 1)的倍数，则创建一个与当前点云点数相同的时间向量
+        if k % (skip_frame + 1) == 0:
+            times = time_lag * np.ones((1, current_pc.nbr_points()))
+        else:
+            # 否则创建一个形状为(1, 1)的虚拟时间向量
+            times = time_lag * np.ones((1, 1))
+
+        # 将当前时间向量水平堆叠到总的时间向量数组中
+        all_times = np.hstack((all_times, times))
+        # 将当前点云的数据水平堆叠到总的点云数据数组中
+        all_pc.points = np.hstack((all_pc.points, current_pc.points))
+
+    # 将变换矩阵列表转换为numpy数组，沿着轴0堆叠
+    trans_matrix_list = np.stack(trans_matrix_list, axis=0)
+
+    # 根据return_trans_matrix参数的值，决定返回的内容
+    if return_trans_matrix:
+        # 如果为True，则返回聚合的点云、压缩后的时间戳和变换矩阵数组
+        return all_pc, np.squeeze(all_times, 0), trans_matrix_list
+    else:
+        # 如果为False，则只返回聚合的点云、压缩后的时间戳
+        return all_pc, np.squeeze(all_times, 0)
+
+def from_file_multisweep_warp2com_sample_data(
+    current_agent,  # 当前代理（智能体）的索引或标识
+    nusc: "NuScenes",  # 一个表示数据集相关的对象，用于获取数据集中的各种记录
+    ref_sd_rec: Dict,  # 当前的样本数据记录
+    return_trans_matrix: bool = False,  # 是否需要返回变换矩阵
+    # min_distance: float = 1.0  # 距离阈值，低于这个距离的点将被丢弃
+    min_distance: float = 0.0  # 距离阈值，低于这个距离的点将被丢弃
+):
+    """
+    Added by Yiming. 2021/3/27
+    V2V dataloader: calculate relative pose and overlap mask between different agents
+    :param ref_sd_rec: The current sample data record
+    :param return_trans_matrix: Whether need to return the transformation matrix
+    :param min_distance: Distance below which points are discarded.
+    :return: (all_pc, all_times). The aggregated point cloud and timestamps.
+    """
+
+    # 初始化
+    # 创建一个全零的数组，用于存储时间戳，形状为（1, 0）
+    all_times = np.zeros((1, 0))
+
+    # 获取参考姿态和时间戳
+    # 根据当前样本数据记录中的ego_pose_token，从nusc对象中获取自我姿态记录
+    ref_pose_rec = nusc.get("ego_pose", ref_sd_rec["ego_pose_token"])
+    # 根据当前样本数据记录中的calibrated_sensor_token，从nusc对象中获取校准传感器记录
+    ref_cs_rec = nusc.get("calibrated_sensor", ref_sd_rec["calibrated_sensor_token"])
+    # 将当前样本数据记录中的时间戳转换为秒（原时间戳单位可能为微秒）
+    ref_time = 1e-6 * ref_sd_rec["timestamp"]
+
+    # 计算从自我汽车坐标系到参考坐标系的齐次变换矩阵
+    # 使用校准传感器记录中的平移和旋转信息，计算逆变换矩阵
+    ref_from_car = transform_matrix(
+        ref_cs_rec["translation"], Quaternion(ref_cs_rec["rotation"]), inverse=True
+    )
+
+    # 计算从全局坐标系到当前自我汽车坐标系的齐次变换矩阵
+    # 使用自我姿态记录中的平移和旋转信息，计算逆变换矩阵
+    car_from_global = transform_matrix(
+        ref_pose_rec["translation"], Quaternion(ref_pose_rec["rotation"]), inverse=True
+    )
+
+    # 聚合当前和之前的扫描数据
+    # 将当前样本数据记录初始化为参考样本数据记录
+    current_sd_rec = ref_sd_rec
+    # 创建一个空列表，用于存储变换矩阵
+    trans_matrix_list = list()
+    # 创建一个空列表，用于存储无十字路口数据的变换矩阵
+    trans_matrix_list_no_cross_road = list()
+
+    # 根据参考样本数据记录中的sample_token，从nusc对象中获取样本记录
+    sample_record = nusc.get("sample", ref_sd_rec["sample_token"])
+    # 设定传感器数量为5（这里直接设定，未使用原来的计算方式）
+    num_sensor = 5
+    # 创建列表，用于存储每个传感器在全局坐标系下的x坐标
+    x_global = [[] for i in range(num_sensor)]
+    # 创建列表，用于存储每个传感器在全局坐标系下的y坐标
+    y_global = [[] for i in range(num_sensor)]
+    # 创建列表，用于存储每个传感器在相对于当前代理的局部坐标系下的x坐标
+    x_local = [[] for i in range(num_sensor)]
+    y_local = [[] for i in range(num_sensor)]
+
+    # 以下两个列表将存储每个代理的数据
+    target_agent_id = current_agent  # 哪个代理是中心代理（初始化为None）
+
+    for k in range(num_sensor):
+        # 加载点云
+        pointsensor_token = sample_record["data"]["LIDAR_BOTTOM_id_" + str(k)]
+        current_sd_rec = nusc.get("sample_data", pointsensor_token)
+
+        # 根据当前样本数据记录中的ego_pose_token，从nusc对象中获取自我姿态记录
+        current_pose_rec = nusc.get("ego_pose", current_sd_rec["ego_pose_token"])
+
+        # 存储当前传感器在全局坐标系下的y坐标
+        y_global[k] = current_pose_rec["translation"][1]
+        # 存储当前传感器在全局坐标系下的x坐标
+        x_global[k] = current_pose_rec["translation"][0]
+
+    for k in range(num_sensor):
+        # 计算每个传感器在相对于当前代理的局部坐标系下的x坐标
+        x_local[k] = x_global[k] - x_global[current_agent]
+        # 计算每个传感器在相对于当前代理的局部坐标系下的y坐标
+        y_local[k] = y_global[k] - y_global[current_agent]
+
+    for k in range(num_sensor):
+        # 加载点云数据
+        # 获取当前传感器（LIDAR_BOTTOM_id_ + k）的点云数据令牌
+        pointsensor_token = sample_record["data"]["LIDAR_BOTTOM_id_" + str(k)]
+        # pointsensor_token = sample_record["data"]["LIDAR_TOP"]
+        # 根据点云数据令牌，从nusc对象中获取当前样本数据记录
+        current_sd_rec = nusc.get("sample_data", pointsensor_token)
+
+        # 如果当前传感器在局部坐标系下的x和y坐标都为0，说明它是目标（中心）代理
+        if x_local[k] == 0.0 and y_local[k] == 0.0:
+        # if k == target_agent_id:
+            # 根据当前样本数据记录中的文件名，从文件中加载点云数据
+            current_pc = LidarPointCloud.from_file(
+                osp.join(nusc.dataroot, current_sd_rec["filename"])
+            )
+            # 根据设定的最小距离，去除当前点云中距离过近的点
+            current_pc.remove_close(min_distance)
+            # 计算当前点云数据的时间滞后
+            time_lag = ref_time - 1e-6 * (
+                current_sd_rec["timestamp"]
+            )  # positive difference
+            # 创建与当前点云点数相同的时间向量
+            times = time_lag * np.ones((1, current_pc.nbr_points()))
+            # 将当前时间向量水平堆叠到总的时间向量数组中
+            all_times = np.hstack((all_times, times))
+
+        # 获取过去的姿态
+        # 根据当前样本数据记录中的ego_pose_token，从nusc对象中获取自我姿态记录
+        current_pose_rec = nusc.get("ego_pose", current_sd_rec["ego_pose_token"])
+        # 使用当前自我姿态记录中的平移和旋转信息，计算从当前自我汽车坐标系到全局坐标系的变换矩阵
+        global_from_car = transform_matrix(
+            np.sum([current_pose_rec["translation"]], axis=0),
+            Quaternion(current_pose_rec["rotation"]),
+            inverse=False,
+        )
+
+        # 计算从传感器坐标系到当前自我汽车坐标系的齐次变换矩阵
+        # 根据当前样本数据记录中的calibrated_sensor_token，从nusc对象中获取校准传感器记录
+        current_cs_rec = nusc.get(
+            "calibrated_sensor", current_sd_rec["calibrated_sensor_token"]
+        )
+        # 使用校准传感器记录中的平移和旋转信息，计算从传感器坐标系到当前自我汽车坐标系的变换矩阵
+        car_from_current = transform_matrix(
+            current_cs_rec["translation"],
+            Quaternion(current_cs_rec["rotation"]),
+            inverse=False,
+        )
+
+        # 将四个变换矩阵融合为一个，并对当前点云进行变换
+        # 使用reduce函数和np.dot方法，将四个变换矩阵相乘，得到最终的变换矩阵
+        trans_matrix = reduce(
+            np.dot, [ref_from_car, car_from_global, global_from_car, car_from_current]
+        )
+
+        # 收集变换矩阵
+        # 将当前的变换矩阵添加到变换矩阵列表中
+        trans_matrix_list.append(trans_matrix)
+
+        # 收集无十字路口数据的变换矩阵
+        # 如果当前传感器不是第一个（可能与十字路口数据有关），则添加到相应列表
+        if k != 0:
+            trans_matrix_list_no_cross_road.append(trans_matrix)
+
+    # 最多的代理数量
+    max_num_agent = 6
+    for k in range(max_num_agent - num_sensor):
+        # 如果传感器数量不足最大代理数量，补充全零的变换矩阵
+        trans_matrix_list.append(np.zeros((4, 4)))
+        trans_matrix_list_no_cross_road.append(np.zeros((4, 4)))
+
+    # 将变换矩阵列表转换为numpy数组，沿着轴0堆叠
+    trans_matrix_list = np.stack(trans_matrix_list, axis=0)
+    # 将无十字路口数据的变换矩阵列表转换为numpy数组，沿着轴0堆叠
+    trans_matrix_list_no_cross_road = np.stack(trans_matrix_list_no_cross_road, axis=0)
+
+    # 根据return_trans_matrix参数的值，决定返回的内容
+    if return_trans_matrix:
+        # 如果为True，则返回当前点云、压缩后的时间戳、变换矩阵数组、无十字路口数据的变换矩阵数组、目标代理索引和传感器数量
+        return (
+            current_pc,
+            np.squeeze(all_times, 0),
+            trans_matrix_list,
+            trans_matrix_list_no_cross_road,
+            target_agent_id,
+            num_sensor,
+        )
+    else:
+        # 如果为False，则只返回当前点云、压缩后的时间戳、目标代理索引和传感器数量
+        return current_pc, np.squeeze(all_times, 0), target_agent_id, num_sensor
+
+def get_ann_of_instance(nusc: "NuScenes", sample_rec: Dict, instance_token: str) -> str:
+        """
+        Return the annotations within the sample which match the given instance.
+        :param sample_rec: The given sample record.
+        :param instance_token: The instance which need to be matched.
+        :return: The annotation which matches the instance.
+        """
+        sd_anns = sample_rec['anns']
+        instance_ann_token = None
+        cnt = 0
+
+        for ann_token in sd_anns:
+            tmp_ann_rec = nusc.get('sample_annotation', ann_token)
+            tmp_instance_token = tmp_ann_rec['instance_token']
+
+            if instance_token == tmp_instance_token:
+                instance_ann_token = ann_token
+                cnt += 1
+
+        assert cnt <= 1, 'One instance cannot associate more than 1 annotations.'
+
+        if cnt == 1:
+            return instance_ann_token
+        else:
+            return ""
+
+def get_instance_box(nusc: "NuScenes", sample_data_token: str, instance_token: str):
+        """
+        Get the bounding box associated with the given instance in the sample data.
+        :param sample_data_token: The sample data identifier at a certain time stamp.
+        :param instance_token: The queried instance.
+        :return: The bounding box associated with the instance.
+        """
+        # Retrieve sensor & pose records
+        sd_record = nusc.get('sample_data', sample_data_token)
+        curr_sample_record = nusc.get('sample', sd_record['sample_token'])
+
+        instance_ann_token = get_ann_of_instance(nusc, curr_sample_record, instance_token)
+        if instance_ann_token == "":
+            return None, None, None
+
+        sample_ann_rec = nusc.get('sample_annotation', instance_ann_token)
+
+        # Get the attribute of this annotation
+        if len(sample_ann_rec['attribute_tokens']) != 0:
+            attr = nusc.get('attribute', sample_ann_rec['attribute_tokens'][0])['name']
+        else:
+            attr = None
+
+        # Get the category of this annotation
+        cat = sample_ann_rec['category_name']
+
+        if curr_sample_record['prev'] == "" or sd_record['is_key_frame']:
+            # If no previous annotations available, or if sample_data is keyframe just return the current ones.
+            box = nusc.get_box(instance_ann_token)
+
+        else:
+            prev_sample_record = nusc.get('sample', curr_sample_record['prev'])
+
+            curr_ann_rec = nusc.get('sample_annotation', instance_ann_token)
+            prev_ann_recs = [nusc.get('sample_annotation', token) for token in prev_sample_record['anns']]
+
+            # Maps instance tokens to prev_ann records
+            prev_inst_map = {entry['instance_token']: entry for entry in prev_ann_recs}
+
+            t0 = prev_sample_record['timestamp']
+            t1 = curr_sample_record['timestamp']
+            t = sd_record['timestamp']
+
+            # There are rare situations where the timestamps in the DB are off so ensure that t0 < t < t1.
+            t = max(t0, min(t1, t))
+
+            if instance_token in prev_inst_map:
+                # If the annotated instance existed in the previous frame, interpolate center & orientation.
+                prev_ann_rec = prev_inst_map[instance_token]
+
+                # Interpolate center.
+                center = [np.interp(t, [t0, t1], [c0, c1]) for c0, c1 in zip(prev_ann_rec['translation'],
+                                                                             curr_ann_rec['translation'])]
+
+                # Interpolate orientation.
+                rotation = Quaternion.slerp(q0=Quaternion(prev_ann_rec['rotation']),
+                                            q1=Quaternion(curr_ann_rec['rotation']),
+                                            amount=(t - t0) / (t1 - t0))
+
+                box = Box(center, curr_ann_rec['size'], rotation, name=curr_ann_rec['category_name'],
+                          token=curr_ann_rec['token'])
+            else:
+                # If not, simply grab the current annotation.
+                box = nusc.get_box(curr_ann_rec['token'])
+
+        return box, attr, cat
+
+def get_instance_boxes_multisweep_sample_data(nusc: 'NuScenes',
+                                                ref_sd_rec: Dict,
+                                                instance_token: str,
+                                                nsweeps_back: int = 5,
+                                                nsweeps_forward: int = 5) -> \
+        Tuple[List['Box'], np.array, List[str], List[str]]:
+    """
+    Return the bounding boxes associated with the given instance. The bounding boxes are across different sweeps.
+    For each bounding box, we need to map its (global) coordinates to the reference frame.
+    For this function, the reference sweep is supposed to be from sample data record (not sample. ie, keyframe).
+    :param nusc: A NuScenes instance.
+    :param ref_sd_rec: The current sample data record.
+    :param instance_token: The current selected instance.
+    :param nsweeps_back: Number of sweeps to aggregate. The sweeps trace back.
+    :param nsweeps_forward: Number of sweeps to aggregate. The sweeps are obtained from the future.
+    :return: (list of bounding boxes, the time stamps of bounding boxes, attribute list, category list)
+    """
+
+    # Init
+    box_list = list()
+    all_times = list()
+    attr_list = list()  # attribute list
+    cat_list = list()  # category list
+
+    # Get reference pose and timestamp
+    ref_pose_rec = nusc.get('ego_pose', ref_sd_rec['ego_pose_token'])
+    ref_cs_rec = nusc.get('calibrated_sensor', ref_sd_rec['calibrated_sensor_token'])
+    ref_time = 1e-6 * ref_sd_rec['timestamp']
+
+    # Get the bounding boxes across different sweeps
+    boxes = list()
+
+    # Move backward to get the past annotations
+    current_sd_rec = ref_sd_rec
+    for _ in range(nsweeps_back):
+        box, attr, cat = get_instance_box(nusc, current_sd_rec['token'], instance_token)
+        boxes.append(box)  # It is possible the returned box is None
+        attr_list.append(attr)
+        cat_list.append(cat)
+
+        time_lag = ref_time - 1e-6 * current_sd_rec['timestamp']  # positive difference
+        all_times.append(time_lag)
+
+        if current_sd_rec['prev'] == '':
+            break
+        else:
+            current_sd_rec = nusc.get('sample_data', current_sd_rec['prev'])
+
+    # Move forward to get the future annotations
+    current_sd_rec = ref_sd_rec
+
+    # Abort if there are no future sweeps.
+    if current_sd_rec['next'] != '':
+        current_sd_rec = nusc.get('sample_data', current_sd_rec['next'])
+
+        for _ in range(nsweeps_forward):
+            box, attr, cat = get_instance_box(nusc, current_sd_rec['token'], instance_token)
+            boxes.append(box)  # It is possible the returned box is None
+            attr_list.append(attr)
+            cat_list.append(cat)
+
+            time_lag = ref_time - 1e-6 * current_sd_rec['timestamp']  # negative difference
+            all_times.append(time_lag)
+
+            if current_sd_rec['next'] == '':
+                break
+            else:
+                current_sd_rec = nusc.get('sample_data', current_sd_rec['next'])
+
+    # Map the bounding boxes to the local sensor coordinate
+    for box in boxes:
+        if box is not None:
+            # Move box to ego vehicle coord system
+            box.translate(-np.array(ref_pose_rec['translation']))
+            box.rotate(Quaternion(ref_pose_rec['rotation']).inverse)
+
+            # Move box to sensor coord system
+            box.translate(-np.array(ref_cs_rec['translation']))
+            box.rotate(Quaternion(ref_cs_rec['rotation']).inverse)
+
+            # caused by coordinate inconsistency of nuscene-toolkit
+            box.center[0] = - box.center[0]
+
+            # debug
+            shift = [box.center[0], box.center[1], box.center[2]]
+            box.translate(-np.array(shift))
+            box.rotate(Quaternion([0, 1, 0, 0]).inverse)
+            box.translate(np.array(shift))
+
+        box_list.append(box)
+    #print(temp)
+    return box_list, all_times, attr_list, cat_list
