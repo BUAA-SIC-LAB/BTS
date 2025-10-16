@@ -46,7 +46,7 @@ And then follow the [Installation](./docs/Installation.md) doc
 #### 2.1 Training
 Train the BTS framework on the Parsed CoSwarm dataset (supports DDP or DP with multiple GPUs):
 > If you don't want use the default arguments, you can enter the training file to modify the default parameters of the code or add command line parameters
-+ DP: [train_bts.py](BTS/coperception/tools/det/BTS/train_bts.py)
++ DP: [train_bts.py](coperception/tools/det/BTS/train_bts.py)
 ```bash
 python train_bts.py
 ```
