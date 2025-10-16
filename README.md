@@ -59,6 +59,7 @@ python train_bts_ddp.py
 #### 2.2 Test
 Run anomaly detection and secure collaborative perception on test data:
 ```bash
+# coperception/tools/det/BTS
 python BTS.py
 ```
 ## Parameter settings
