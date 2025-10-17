@@ -109,7 +109,7 @@ Comparison of defense performance between BTS and different baselines
 |-------------|------------|------------|
 | IUB         | 73.7       | 66.6       |
 | UB (oracle) | 71.2       | 64.8       |
-| BTS (ours)  | 65.3       | 59.3       |
+| **BTS (ours)**  | **71.1**       | **65.0**       |
 | ROBOSAC     | 65.3       | 59.3       |
 | LB          | 55.7       | 50.0       |
 | ND          | 23.1       | 22.2       |
